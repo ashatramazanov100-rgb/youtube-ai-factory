@@ -1,0 +1,119 @@
+name: Daily Shorts
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 5 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: daily-shorts
+  cancel-in-progress: false
+jobs:
+  render:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      OLLAMA_NO_CLOUD: '1'
+      OLLAMA_HOST: 127.0.0.1:11434
+      TZ: Asia/Qyzylorda
+    steps:
+      - name: Install narration and video tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core python3-venv
+          python3 -m venv "$RUNNER_TEMP/piper"
+          "$RUNNER_TEMP/piper/bin/pip" install piper-tts==1.8.0
+          "$RUNNER_TEMP/piper/bin/python" -m piper.download_voices en_US-lessac-medium
+          curl -fsSL https://ollama.com/install.sh -o "$RUNNER_TEMP/ollama.sh"
+          sudo env OLLAMA_NO_CLOUD=1 bash "$RUNNER_TEMP/ollama.sh"
+          sudo systemctl stop ollama.service || true
+      - name: Create and verify Short
+        run: |
+          ollama serve > "$RUNNER_TEMP/ollama.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..30}; do
+            if curl -fsS http://127.0.0.1:11434/api/version >/dev/null; then break; fi
+            sleep 1
+          done
+          ollama pull qwen2.5:3b
+          python3 - <<'PY'
+          import datetime, json, math, os, random, subprocess, urllib.request
+          from pathlib import Path
+
+          day = datetime.date.today()
+          seeds = ['a signal beneath the ice of a moon', 'sunrise over a ringed planet', 'a traveler seeing two suns', 'a beacon beyond a nebula', 'an aurora around a frozen world', 'a spacecraft passing a gas giant']
+          concept = seeds[day.toordinal() % len(seeds)]
+          payload = dict(model='qwen2.5:3b', stream=False, format='json', options={'num_predict': 180}, messages=[{'role':'user','content':f'Write a fictional English short about {concept}. Return JSON with title (at most 5 words) and voiceover (one vivid sentence of 12-18 words). Do not present fiction as fact.'}])
+          for attempt in range(2):
+              req = urllib.request.Request('http://127.0.0.1:11434/api/chat', data=json.dumps(payload).encode(), headers={'Content-Type':'application/json'})
+              with urllib.request.urlopen(req, timeout=150) as response:
+                  reply = json.load(response)
+              try:
+                  script = json.loads(reply['message']['content'])
+                  title, voice = script['title'].strip(), script['voiceover'].strip()
+                  if 1 <= len(title) <= 50 and 10 <= len(voice.split()) <= 20 and all(32 <= ord(c) <= 126 for c in title + voice):
+                      break
+              except (KeyError, TypeError, ValueError, AttributeError):
+                  pass
+          else:
+              raise ValueError('Invalid script after two attempts')
+
+          def run(*args):
+              subprocess.run(args, check=True)
+
+          def probe(path):
+              return json.loads(subprocess.check_output(['ffprobe','-v','error','-show_streams','-show_format','-of','json',path]))
+
+          python = str(Path(os.environ['RUNNER_TEMP']) / 'piper/bin/python')
+          run(python, '-m', 'piper', '-m', 'en_US-lessac-medium', '-f', 'voice.wav', '--', voice)
+          length = float(probe('voice.wav')['format']['duration'])
+          assert 0 < length < 9.6
+          rng = random.Random(day.toordinal())
+          color = rng.choice([(105,210,255),(255,149,107),(205,155,255)])
+          stars = {(rng.randrange(540),rng.randrange(960)): rng.randrange(35,210) for _ in range(550)}
+          pixels = bytearray()
+          for y in range(960):
+              for x in range(540):
+                  dx, dy = (x-268)/153, (y-440)/153
+                  d = math.hypot(dx,dy)
+                  light = max(0, math.sqrt(max(0,1-d*d))*.6-dx*.55-dy*.45) if d < 1 else 0
+                  glow = .10*math.exp(-abs(d-1)*15)
+                  stripes = .72+.18*math.sin(y*.13+math.sin(x*.032))
+                  star = stars.get((x,y),0) if d > 1 else 0
+                  pixels.extend(max(star,min(255,int(base+c*(glow+light*stripes)))) for base,c in zip((6,9,22),color))
+          Path('planet.ppm').write_bytes(b'P6\n540 960\n255\n'+pixels)
+
+          def stamp(value):
+              return f'00:00:{value:06.3f}'.replace('.', ',')
+
+          words = voice.replace('<','').replace('>','').split()
+          groups = [words[i:i+4] for i in range(0,len(words),4)]
+          entries = []
+          elapsed = .3
+          for index, group in enumerate(groups,1):
+              end = elapsed + length*len(group)/len(words)
+              entries.append(f'{index}\n{stamp(elapsed)} --> {stamp(end)}\n'+ ' '.join(group))
+              elapsed = end
+          Path('captions.srt').write_text('\n\n'.join(entries)+'\n',encoding='utf-8')
+          Path('title.txt').write_text(title,encoding='utf-8')
+          dest = Path('cloud-output')
+          dest.mkdir()
+          mp4 = str(dest / f'short-{day}.mp4')
+          vf = "scale=2160:3840,zoompan=z='1.015+on*0.00032':x='iw/2-iw/zoom/2':y='ih/2-ih/zoom/2':d=300:s=1080x1920:fps=30,drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:textfile=title.txt:expansion=none:fontsize=54:fontcolor=white:borderw=3:x=(w-tw)/2:y=280,subtitles=captions.srt:force_style='FontName=DejaVu Sans,FontSize=13,Outline=2,MarginV=65'"
+          run('ffmpeg','-v','error','-i','planet.ppm','-i','voice.wav','-filter_threads','2','-vf',vf,'-af','adelay=300:all=1,loudnorm=I=-16:TP=-1.5:LRA=7,apad','-t','10','-c:v','libx264','-preset','veryfast','-pix_fmt','yuv420p','-threads','3','-c:a','aac','-movflags','+faststart',mp4)
+          info = probe(mp4)
+          video = next(s for s in info['streams'] if s['codec_type']=='video')
+          assert (video['width'],video['height'],video['avg_frame_rate'],video['codec_name']) == (1080,1920,'30/1','h264')
+          assert any(s['codec_name']=='aac' for s in info['streams']) and abs(float(info['format']['duration'])-10)<.1
+          assert Path(mp4).stat().st_size < 10 * 1024 * 1024
+          run('ffmpeg','-v','error','-xerror','-i',mp4,'-f','null','-')
+          (dest/'youtube.txt').write_text(f'{title}\n\n{voice}\n\n#Shorts #SpaceFiction\n',encoding='utf-8')
+          print('Verified cloud Short:', title)
+          PY
+      - uses: actions/upload-artifact@v6
+        with:
+          name: youtube-short
+          path: cloud-output/
+          if-no-files-found: error
+          retention-days: 7
